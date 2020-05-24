@@ -11,13 +11,17 @@ import torch.nn as nn
 from pathlib import Path
 lib_dir = (Path(__file__).parent / '..' / '..' / 'lib').resolve()
 if str(lib_dir) not in sys.path: sys.path.insert(0, str(lib_dir))
+lib_dir = (Path(__file__).parent / '..' / '..' / 'exps/NAS-Bench-201/').resolve()
+if str(lib_dir) not in sys.path: sys.path.insert(0, str(lib_dir))
 from config_utils import load_config, dict2config, configure2str
 from datasets     import get_datasets, SearchDataset
-from procedures   import prepare_seed, prepare_logger, save_checkpoint, copy_checkpoint, get_optim_scheduler
+from procedures   import prepare_seed, prepare_logger, save_checkpoint, copy_checkpoint, get_optim_scheduler, get_machine_info
 from utils        import get_model_infos, obtain_accuracy
 from log_utils    import AverageMeter, time_string, convert_secs2time
 from nas_201_api  import NASBench201API as API
-from models       import CellStructure, get_search_spaces
+from models       import CellStructure, get_search_spaces, CellArchitectures
+from log_utils    import Logger, AverageMeter, time_string, convert_secs2time
+from functions    import evaluate_for_seed
 
 
 class Model(object):
@@ -37,9 +41,19 @@ class Model(object):
 #       In this case, the LR schedular is converged.
 # For use_012_epoch_training = False, the architecture is planed to be trained for 200 epochs, but we early stop its procedure.
 #       
-def train_and_eval(arch, nas_bench, extra_info, dataname='cifar10-valid', use_012_epoch_training=True):
+def train_and_eval(args, data, logger, arch, nas_bench, extra_info, dataname='cifar10-valid', use_012_epoch_training=True, use_loss_extrapolation=False):
 
-  if use_012_epoch_training and nas_bench is not None:
+  if use_loss_extrapolation:
+    arch_index = nas_bench.query_index_by_arch( arch )
+    nepoch = 25
+    assert arch_index >= 0, 'can not find this arch : {:}'.format(arch)
+    config, train_loader, valid_loader = data
+    arch_config={'channel': args.channel, 'num_cells': args.num_cells}
+    results = evaluate_for_seed(arch_config, config, arch, train_loader, {'valid' : valid_loader}, seed=0, logger=logger)
+    valid_acc = results['valid_acc1es']
+    time_cost = None
+
+  elif use_012_epoch_training and nas_bench is not None:
     arch_index = nas_bench.query_index_by_arch( arch )
     assert arch_index >= 0, 'can not find this arch : {:}'.format(arch)
     info = nas_bench.get_more_info(arch_index, dataname, None, True)
@@ -51,26 +65,99 @@ def train_and_eval(arch, nas_bench, extra_info, dataname='cifar10-valid', use_01
     # It did return values for cifar100 and ImageNet16-120, but it has some potential issues. (Please email me for more details)
     arch_index, nepoch = nas_bench.query_index_by_arch( arch ), 25
     assert arch_index >= 0, 'can not find this arch : {:}'.format(arch)
-    xoinfo = nas_bench.get_more_info(arch_index, 'cifar10-valid', None, True)
-    xocost = nas_bench.get_cost_info(arch_index, 'cifar10-valid', False)
-    info = nas_bench.get_more_info(arch_index, dataname, nepoch, False, True) # use the validation accuracy after 25 training epochs, which is used in our ICLR submission (not the camera ready).
-    cost = nas_bench.get_cost_info(arch_index, dataname, False)
+    try:
+      valid_acc = info['valid-accuracy']
+    except:
+      valid_acc = info['valtest-accuracy']
+
+    time_cost = None
+  else:
+    # train a model from scratch.
+    raise ValueError('NOT IMPLEMENT YET')
+
+  if time_cost is None:
     # The following codes are used to estimate the time cost.
     # When we build NAS-Bench-201, architectures are trained on different machines and we can not use that time record.
     # When we create checkpoints for converged_LR, we run all experiments on 1080Ti, and thus the time for each architecture can be fairly compared.
     nums = {'ImageNet16-120-train': 151700, 'ImageNet16-120-valid': 3000,
             'cifar10-valid-train' : 25000,  'cifar10-valid-valid' : 25000,
             'cifar100-train'      : 50000,  'cifar100-valid'      : 5000}
+
+    xoinfo = nas_bench.get_more_info(arch_index, 'cifar10-valid', None, True)
+    xocost = nas_bench.get_cost_info(arch_index, 'cifar10-valid', False)
+    info = nas_bench.get_more_info(arch_index, dataname, nepoch, False, True) # use the validation accuracy after 25 training epochs, which is used in our ICLR submission (not the camera ready).
+    cost = nas_bench.get_cost_info(arch_index, dataname, False)
     estimated_train_cost = xoinfo['train-per-time'] / nums['cifar10-valid-train'] * nums['{:}-train'.format(dataname)] / xocost['latency'] * cost['latency'] * nepoch
     estimated_valid_cost = xoinfo['valid-per-time'] / nums['cifar10-valid-valid'] * nums['{:}-valid'.format(dataname)] / xocost['latency'] * cost['latency']
-    try:
-      valid_acc, time_cost = info['valid-accuracy'], estimated_train_cost + estimated_valid_cost
-    except:
-      valid_acc, time_cost = info['valtest-accuracy'], estimated_train_cost + estimated_valid_cost
-  else:
-    # train a model from scratch.
-    raise ValueError('NOT IMPLEMENT YET')
+    time_cost = estimated_train_cost + estimated_valid_cost
   return valid_acc, time_cost
+
+def run_model(arch, dataset, xpath, split, seed, arch_config, workers, logger):
+  use_less = True
+  machine_info, arch_config = get_machine_info(), deepcopy(arch_config)
+  all_infos = {'info': machine_info}
+  all_dataset_keys = []
+  # train valid data
+  train_data, valid_data, xshape, class_num = get_datasets(dataset, xpath, -1)
+  # load the configuration
+  if dataset == 'cifar10' or dataset == 'cifar100':
+    if use_less: config_path = 'configs/nas-benchmark/LESS.config'
+    else       : config_path = 'configs/nas-benchmark/CIFAR.config'
+    split_info  = load_config('configs/nas-benchmark/cifar-split.txt', None, None)
+  elif dataset.startswith('ImageNet16'):
+    if use_less: config_path = 'configs/nas-benchmark/LESS.config'
+    else       : config_path = 'configs/nas-benchmark/ImageNet-16.config'
+    split_info  = load_config('configs/nas-benchmark/{:}-split.txt'.format(dataset), None, None)
+  else:
+    raise ValueError('invalid dataset : {:}'.format(dataset))
+  config = load_config(config_path, \
+                          {'class_num': class_num,
+                           'xshape'   : xshape}, \
+                          logger)
+  # check whether use splited validation set
+  if bool(split):
+    assert dataset == 'cifar10'
+    ValLoaders = {'ori-test': torch.utils.data.DataLoader(valid_data, batch_size=config.batch_size, shuffle=False, num_workers=workers, pin_memory=True)}
+    assert len(train_data) == len(split_info.train) + len(split_info.valid), 'invalid length : {:} vs {:} + {:}'.format(len(train_data), len(split_info.train), len(split_info.valid))
+    train_data_v2 = deepcopy(train_data)
+    train_data_v2.transform = valid_data.transform
+    valid_data = train_data_v2
+    # data loader
+    train_loader = torch.utils.data.DataLoader(train_data, batch_size=config.batch_size, sampler=torch.utils.data.sampler.SubsetRandomSampler(split_info.train), num_workers=workers, pin_memory=True)
+    valid_loader = torch.utils.data.DataLoader(valid_data, batch_size=config.batch_size, sampler=torch.utils.data.sampler.SubsetRandomSampler(split_info.valid), num_workers=workers, pin_memory=True)
+    ValLoaders['x-valid'] = valid_loader
+  else:
+    # data loader
+    train_loader = torch.utils.data.DataLoader(train_data, batch_size=config.batch_size, shuffle=True , num_workers=workers, pin_memory=True)
+    valid_loader = torch.utils.data.DataLoader(valid_data, batch_size=config.batch_size, shuffle=False, num_workers=workers, pin_memory=True)
+    if dataset == 'cifar10':
+      ValLoaders = {'ori-test': valid_loader}
+    elif dataset == 'cifar100':
+      cifar100_splits = load_config('configs/nas-benchmark/cifar100-test-split.txt', None, None)
+      ValLoaders = {'ori-test': valid_loader,
+                    'x-valid' : torch.utils.data.DataLoader(valid_data, batch_size=config.batch_size, sampler=torch.utils.data.sampler.SubsetRandomSampler(cifar100_splits.xvalid), num_workers=workers, pin_memory=True),
+                    'x-test'  : torch.utils.data.DataLoader(valid_data, batch_size=config.batch_size, sampler=torch.utils.data.sampler.SubsetRandomSampler(cifar100_splits.xtest ), num_workers=workers, pin_memory=True)
+                   }
+    elif dataset == 'ImageNet16-120':
+      imagenet16_splits = load_config('configs/nas-benchmark/imagenet-16-120-test-split.txt', None, None)
+      ValLoaders = {'ori-test': valid_loader,
+                    'x-valid' : torch.utils.data.DataLoader(valid_data, batch_size=config.batch_size, sampler=torch.utils.data.sampler.SubsetRandomSampler(imagenet16_splits.xvalid), num_workers=workers, pin_memory=True),
+                    'x-test'  : torch.utils.data.DataLoader(valid_data, batch_size=config.batch_size, sampler=torch.utils.data.sampler.SubsetRandomSampler(imagenet16_splits.xtest ), num_workers=workers, pin_memory=True)
+                   }
+    else:
+      raise ValueError('invalid dataset : {:}'.format(dataset))
+
+  dataset_key = '{:}'.format(dataset)
+  if bool(split): dataset_key = dataset_key + '-valid'
+  logger.log('Evaluate ||||||| {:10s} ||||||| Train-Num={:}, Valid-Num={:}, Train-Loader-Num={:}, Valid-Loader-Num={:}, batch size={:}'.format(dataset_key, len(train_data), len(valid_data), len(train_loader), len(valid_loader), config.batch_size))
+  logger.log('Evaluate ||||||| {:10s} ||||||| Config={:}'.format(dataset_key, config))
+  for key, value in ValLoaders.items():
+    logger.log('Evaluate ---->>>> {:10s} with {:} batchs'.format(key, len(value)))
+  results = evaluate_for_seed(arch_config, config, arch, train_loader, ValLoaders, seed, logger)
+  all_infos[dataset_key] = results
+  all_dataset_keys.append( dataset_key )
+  all_infos['all_dataset_keys'] = all_dataset_keys
+  return all_infos
 
 
 def random_architecture_func(max_nodes, op_names):
@@ -106,7 +193,7 @@ def mutate_arch_func(op_names):
   return mutate_arch_func
 
 
-def regularized_evolution(cycles, population_size, sample_size, time_budget, random_arch, mutate_arch, nas_bench, extra_info, dataname):
+def regularized_evolution(args, data, logger, cycles, population_size, sample_size, time_budget, random_arch, mutate_arch, nas_bench, extra_info, dataname):
   """Algorithm for regularized evolution (i.e. aging evolution).
   
   Follows "Algorithm 1" in Real et al. "Regularized Evolution for Image
@@ -129,7 +216,7 @@ def regularized_evolution(cycles, population_size, sample_size, time_budget, ran
   while len(population) < population_size:
     model = Model()
     model.arch = random_arch()
-    model.accuracy, time_cost = train_and_eval(model.arch, nas_bench, extra_info, dataname)
+    model.accuracy, time_cost = train_and_eval(args, data, logger, model.arch, nas_bench, extra_info, dataname, use_loss_extrapolation=args.extrapolate)
     population.append(model)
     history.append(model)
     total_time_cost += time_cost
@@ -154,7 +241,7 @@ def regularized_evolution(cycles, population_size, sample_size, time_budget, ran
     child = Model()
     child.arch = mutate_arch(parent.arch)
     total_time_cost += time.time() - start_time
-    child.accuracy, time_cost = train_and_eval(child.arch, nas_bench, extra_info, dataname)
+    child.accuracy, time_cost = train_and_eval(child.arch, nas_bench, extra_info, dataname, use_loss_extrapolation=args.extrapolate)
     if total_time_cost + time_cost > time_budget: # return
       return history, total_time_cost
     else:
@@ -212,7 +299,8 @@ def main(xargs, nas_bench):
   x_start_time = time.time()
   logger.log('{:} use nas_bench : {:}'.format(time_string(), nas_bench))
   logger.log('-'*30 + ' start searching with the time budget of {:} s'.format(xargs.time_budget))
-  history, total_cost = regularized_evolution(xargs.ea_cycles, xargs.ea_population, xargs.ea_sample_size, xargs.time_budget, random_arch, mutate_arch, nas_bench if args.ea_fast_by_api else None, extra_info, dataname)
+  data = [config, train_loader, valid_loader]
+  history, total_cost = regularized_evolution(xargs, data, logger, xargs.ea_cycles, xargs.ea_population, xargs.ea_sample_size, xargs.time_budget, random_arch, mutate_arch, nas_bench if args.ea_fast_by_api else None, extra_info, dataname)
   logger.log('{:} regularized_evolution finish with history of {:} arch with {:.1f} s (real-cost={:.2f} s).'.format(time_string(), len(history), total_cost, time.time()-x_start_time))
   best_arch = max(history, key=lambda i: i.accuracy)
   best_arch = best_arch.arch
@@ -225,6 +313,8 @@ def main(xargs, nas_bench):
   logger.close()
   return logger.log_dir, nas_bench.query_index_by_arch( best_arch )
   
+
+
 
 
 if __name__ == '__main__':
@@ -247,6 +337,7 @@ if __name__ == '__main__':
   parser.add_argument('--arch_nas_dataset',   type=str,   help='The path to load the architecture dataset (tiny-nas-benchmark).')
   parser.add_argument('--print_freq',         type=int,   help='print frequency (default: 200)')
   parser.add_argument('--rand_seed',          type=int,   default=-1,   help='manual seed')
+  parser.add_argument('--extrapolate',        action='store_true',   help='Use loss extrapolation.')
   args = parser.parse_args()
   #if args.rand_seed is None or args.rand_seed < 0: args.rand_seed = random.randint(1, 100000)
   args.ea_fast_by_api = args.ea_fast_by_api > 0
@@ -266,3 +357,6 @@ if __name__ == '__main__':
     torch.save(all_indexes, save_dir / 'results.pth')
   else:
     main(args, nas_bench)
+
+
+

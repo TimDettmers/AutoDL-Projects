@@ -31,8 +31,9 @@ save_dir=./output/search-cell-${space}/R-EA-${dataset}-SS${sample_size}
 OMP_NUM_THREADS=4 python ./exps/algos/R_EA.py \
 	--save_dir ${save_dir} --max_nodes ${max_nodes} --channel ${channel} --num_cells ${num_cells} \
 	--dataset ${dataset} \
+  --data_path $TORCH_HOME/cifar.python \
 	--search_space_name ${space} \
 	--arch_nas_dataset ${benchmark_file} \
 	--time_budget 12000 \
 	--ea_cycles 200 --ea_population 10 --ea_sample_size ${sample_size} --ea_fast_by_api 1 \
-	--workers 4 --print_freq 200 --rand_seed ${seed}
+	--workers 4 --print_freq 200 --rand_seed ${seed} --extrapolate
