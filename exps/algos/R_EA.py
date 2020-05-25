@@ -5,6 +5,7 @@
 ##################################################################
 import os, sys, time, glob, random, argparse
 import numpy as np, collections
+import random
 from copy import deepcopy
 import torch
 import torch.nn as nn
@@ -45,16 +46,32 @@ def train_and_eval(args, data, logger, arch, nas_bench, extra_info, dataname='ci
 
   if use_loss_extrapolation:
     arch_index = nas_bench.query_index_by_arch( arch )
-    nepoch = 25
+    print('='*80)
+    print('ARCH INDEX: {0}'.format(arch_index))
+    print('='*80)
+    nepoch = 12
     assert arch_index >= 0, 'can not find this arch : {:}'.format(arch)
     config, train_loader, valid_loader = data
     arch_config={'channel': args.channel, 'num_cells': args.num_cells}
-    results = evaluate_for_seed(arch_config, config, arch, train_loader, {'valid' : valid_loader}, seed=0, logger=logger)
-    valid_acc = results['valid_acc1es']
+    t0 = time.time()
+    print(config, 'CONFIG')
+    results = evaluate_for_seed(arch_config, config, arch, train_loader, {'valid' : valid_loader}, seed=random.randint(0, (2**32)-1), logger=logger)
+    key= '{:}@{:}'.format('valid',nepoch-1)
+    valid_acc = results['valid_acc1es'][key]
     time_cost = None
+
+    info = nas_bench.get_more_info(arch_index, dataname, None, True)
+    valid_acc2, time_cost2 = info['valid-accuracy'], info['train-all-time'] + info['valid-per-time']
+    print('Taken: {0:.2f} s'.format(time.time()-t0))
+    print('API time: {0:.2f}'.format(time_cost2))
+    print('Validation accuracy 25 epochs: {0:.2f}'.format(valid_acc))
+    print('Validation accuracy reference: {0:.2f}'.format(valid_acc2))
 
   elif use_012_epoch_training and nas_bench is not None:
     arch_index = nas_bench.query_index_by_arch( arch )
+    print('='*80)
+    print('ARCH INDEX: {0}'.format(arch_index))
+    print('='*80)
     assert arch_index >= 0, 'can not find this arch : {:}'.format(arch)
     info = nas_bench.get_more_info(arch_index, dataname, None, True)
     valid_acc, time_cost = info['valid-accuracy'], info['train-all-time'] + info['valid-per-time']
@@ -90,74 +107,8 @@ def train_and_eval(args, data, logger, arch, nas_bench, extra_info, dataname='ci
     estimated_train_cost = xoinfo['train-per-time'] / nums['cifar10-valid-train'] * nums['{:}-train'.format(dataname)] / xocost['latency'] * cost['latency'] * nepoch
     estimated_valid_cost = xoinfo['valid-per-time'] / nums['cifar10-valid-valid'] * nums['{:}-valid'.format(dataname)] / xocost['latency'] * cost['latency']
     time_cost = estimated_train_cost + estimated_valid_cost
+    print('Adjusted time cost: {0:.2f}'.format(time_cost))
   return valid_acc, time_cost
-
-def run_model(arch, dataset, xpath, split, seed, arch_config, workers, logger):
-  use_less = True
-  machine_info, arch_config = get_machine_info(), deepcopy(arch_config)
-  all_infos = {'info': machine_info}
-  all_dataset_keys = []
-  # train valid data
-  train_data, valid_data, xshape, class_num = get_datasets(dataset, xpath, -1)
-  # load the configuration
-  if dataset == 'cifar10' or dataset == 'cifar100':
-    if use_less: config_path = 'configs/nas-benchmark/LESS.config'
-    else       : config_path = 'configs/nas-benchmark/CIFAR.config'
-    split_info  = load_config('configs/nas-benchmark/cifar-split.txt', None, None)
-  elif dataset.startswith('ImageNet16'):
-    if use_less: config_path = 'configs/nas-benchmark/LESS.config'
-    else       : config_path = 'configs/nas-benchmark/ImageNet-16.config'
-    split_info  = load_config('configs/nas-benchmark/{:}-split.txt'.format(dataset), None, None)
-  else:
-    raise ValueError('invalid dataset : {:}'.format(dataset))
-  config = load_config(config_path, \
-                          {'class_num': class_num,
-                           'xshape'   : xshape}, \
-                          logger)
-  # check whether use splited validation set
-  if bool(split):
-    assert dataset == 'cifar10'
-    ValLoaders = {'ori-test': torch.utils.data.DataLoader(valid_data, batch_size=config.batch_size, shuffle=False, num_workers=workers, pin_memory=True)}
-    assert len(train_data) == len(split_info.train) + len(split_info.valid), 'invalid length : {:} vs {:} + {:}'.format(len(train_data), len(split_info.train), len(split_info.valid))
-    train_data_v2 = deepcopy(train_data)
-    train_data_v2.transform = valid_data.transform
-    valid_data = train_data_v2
-    # data loader
-    train_loader = torch.utils.data.DataLoader(train_data, batch_size=config.batch_size, sampler=torch.utils.data.sampler.SubsetRandomSampler(split_info.train), num_workers=workers, pin_memory=True)
-    valid_loader = torch.utils.data.DataLoader(valid_data, batch_size=config.batch_size, sampler=torch.utils.data.sampler.SubsetRandomSampler(split_info.valid), num_workers=workers, pin_memory=True)
-    ValLoaders['x-valid'] = valid_loader
-  else:
-    # data loader
-    train_loader = torch.utils.data.DataLoader(train_data, batch_size=config.batch_size, shuffle=True , num_workers=workers, pin_memory=True)
-    valid_loader = torch.utils.data.DataLoader(valid_data, batch_size=config.batch_size, shuffle=False, num_workers=workers, pin_memory=True)
-    if dataset == 'cifar10':
-      ValLoaders = {'ori-test': valid_loader}
-    elif dataset == 'cifar100':
-      cifar100_splits = load_config('configs/nas-benchmark/cifar100-test-split.txt', None, None)
-      ValLoaders = {'ori-test': valid_loader,
-                    'x-valid' : torch.utils.data.DataLoader(valid_data, batch_size=config.batch_size, sampler=torch.utils.data.sampler.SubsetRandomSampler(cifar100_splits.xvalid), num_workers=workers, pin_memory=True),
-                    'x-test'  : torch.utils.data.DataLoader(valid_data, batch_size=config.batch_size, sampler=torch.utils.data.sampler.SubsetRandomSampler(cifar100_splits.xtest ), num_workers=workers, pin_memory=True)
-                   }
-    elif dataset == 'ImageNet16-120':
-      imagenet16_splits = load_config('configs/nas-benchmark/imagenet-16-120-test-split.txt', None, None)
-      ValLoaders = {'ori-test': valid_loader,
-                    'x-valid' : torch.utils.data.DataLoader(valid_data, batch_size=config.batch_size, sampler=torch.utils.data.sampler.SubsetRandomSampler(imagenet16_splits.xvalid), num_workers=workers, pin_memory=True),
-                    'x-test'  : torch.utils.data.DataLoader(valid_data, batch_size=config.batch_size, sampler=torch.utils.data.sampler.SubsetRandomSampler(imagenet16_splits.xtest ), num_workers=workers, pin_memory=True)
-                   }
-    else:
-      raise ValueError('invalid dataset : {:}'.format(dataset))
-
-  dataset_key = '{:}'.format(dataset)
-  if bool(split): dataset_key = dataset_key + '-valid'
-  logger.log('Evaluate ||||||| {:10s} ||||||| Train-Num={:}, Valid-Num={:}, Train-Loader-Num={:}, Valid-Loader-Num={:}, batch size={:}'.format(dataset_key, len(train_data), len(valid_data), len(train_loader), len(valid_loader), config.batch_size))
-  logger.log('Evaluate ||||||| {:10s} ||||||| Config={:}'.format(dataset_key, config))
-  for key, value in ValLoaders.items():
-    logger.log('Evaluate ---->>>> {:10s} with {:} batchs'.format(key, len(value)))
-  results = evaluate_for_seed(arch_config, config, arch, train_loader, ValLoaders, seed, logger)
-  all_infos[dataset_key] = results
-  all_dataset_keys.append( dataset_key )
-  all_infos['all_dataset_keys'] = all_dataset_keys
-  return all_infos
 
 
 def random_architecture_func(max_nodes, op_names):
@@ -241,7 +192,7 @@ def regularized_evolution(args, data, logger, cycles, population_size, sample_si
     child = Model()
     child.arch = mutate_arch(parent.arch)
     total_time_cost += time.time() - start_time
-    child.accuracy, time_cost = train_and_eval(child.arch, nas_bench, extra_info, dataname, use_loss_extrapolation=args.extrapolate)
+    child.accuracy, time_cost = train_and_eval(args, data, logger, child.arch, nas_bench, extra_info, dataname, use_loss_extrapolation=args.extrapolate)
     if total_time_cost + time_cost > time_budget: # return
       return history, total_time_cost
     else:
@@ -273,7 +224,8 @@ def main(xargs, nas_bench):
     cifar_split = load_config(split_Fpath, None, None)
     train_split, valid_split = cifar_split.train, cifar_split.valid
     logger.log('Load split file from {:}'.format(split_Fpath))
-    config_path = 'configs/nas-benchmark/algos/R-EA.config'
+    #config_path = 'configs/nas-benchmark/algos/R-EA.config'
+    config_path = 'configs/nas-benchmark/LESS.config'
     config = load_config(config_path, {'class_num': class_num, 'xshape': xshape}, logger)
     # To split data
     train_data_v2 = deepcopy(train_data)
